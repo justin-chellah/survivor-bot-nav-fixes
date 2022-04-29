@@ -35,14 +35,20 @@ enum NavAttributeType
 };
 
 DynamicHook g_hDHook_ILocomotion_IsRunning = null;
+DynamicHook g_hDHook_CBasePlayer_OnNavAreaChanged = null;
 
 Handle g_hSDKCall_INextBot_GetLocomotionInterface = null;
 Handle g_hSDKCall_INextBot_MySurvivorBotPointer = null;
 Handle g_hSDKCall_NextBotPlayer_CTerrorPlayer_MyNextBotPointer = null;
 Handle g_hSDKCall_CBaseCombatCharacter_GetLastKnownArea = null;
+Handle g_hSDKCall_ILocomotion_Jump = null;
 
 int g_nOffset_PlayerLocomotion_m_player = -1;
 int g_nOffset_CNavArea_m_attributeFlags = -1;
+int g_nOffset_NextBotPlayer_CTerrorPlayer_m_inputButtons = -1;
+int g_nOffset_NextBotPlayer_CTerrorPlayer_m_crouchButtonTimer = -1;
+
+bool g_bStopping[32+1];
 
 Address INextBot_GetLocomotionInterface( const Address adrThis )
 {
@@ -64,9 +70,24 @@ Address CBaseCombatCharacter_GetLastKnownArea( const Address adrClient )
 	return SDKCall( g_hSDKCall_CBaseCombatCharacter_GetLastKnownArea, adrClient );
 }
 
+void ILocomotion_Jump( const Address adrThis )
+{
+	SDKCall( g_hSDKCall_ILocomotion_Jump, adrThis );
+}
+
 NavAttributeType CNavArea_GetAttributes( const Address adrNavArea )
 {
 	return view_as< NavAttributeType >( LoadFromAddress( adrNavArea + view_as< Address >( g_nOffset_CNavArea_m_attributeFlags ), NumberType_Int32 ) );
+}
+
+void INextBotPlayerInput_PressCrouchButton( int iClient, float flDuration = -1.0 )
+{
+	int fInputButtons = GetEntData( iClient, g_nOffset_NextBotPlayer_CTerrorPlayer_m_inputButtons );
+
+	SetEntData( iClient, g_nOffset_NextBotPlayer_CTerrorPlayer_m_inputButtons, fInputButtons | IN_DUCK );
+
+	SetEntDataFloat( iClient, g_nOffset_NextBotPlayer_CTerrorPlayer_m_crouchButtonTimer + 4, flDuration );
+	SetEntDataFloat( iClient, g_nOffset_NextBotPlayer_CTerrorPlayer_m_crouchButtonTimer + 8, GetGameTime() + flDuration );
 }
 
 public MRESReturn DHook_PlayerLocomotion_IsRunning( Address adrThis, DHookReturn hReturn, DHookParam hParams )
@@ -84,6 +105,24 @@ public MRESReturn DHook_PlayerLocomotion_IsRunning( Address adrThis, DHookReturn
 	return MRES_Ignored;
 }
 
+public MRESReturn DHook_SurvivorBot_OnNavAreaChanged_Post( int iThis, DHookParam hParams )
+{
+	Address adrEnteredArea = hParams.GetAddress( 1 );
+
+	if ( adrEnteredArea == Address_Null )
+	{
+		return MRES_Ignored;
+	}
+
+	// if we just entered a 'stop' area, set the flag
+	if ( CNavArea_GetAttributes( adrEnteredArea ) & NAV_MESH_STOP )
+	{
+		g_bStopping[iThis] = true;
+	}
+
+	return MRES_Ignored;
+}
+
 public void OnClientPutInServer( int iClient )
 {
 	char szNetClass[32];
@@ -94,6 +133,7 @@ public void OnClientPutInServer( int iClient )
 		Address adrNextBot = NextBotPlayer_CTerrorPlayer_MyNextBotPointer( iClient );
 
 		g_hDHook_ILocomotion_IsRunning.HookRaw( Hook_Pre, INextBot_GetLocomotionInterface( adrNextBot ), DHook_PlayerLocomotion_IsRunning );
+		g_hDHook_CBasePlayer_OnNavAreaChanged.HookEntity( Hook_Post, iClient, DHook_SurvivorBot_OnNavAreaChanged_Post );
 	}
 }
 
@@ -112,6 +152,48 @@ public MRESReturn DDetour_PathFollower_Climbing( Address adrThis, DHookReturn hR
 			DHookSetReturn( hReturn, false );
 
 			return MRES_Supercede;
+		}
+	}
+
+	return MRES_Ignored;
+}
+
+public MRESReturn DDetour_PathFollower_Update( Address adrThis, DHookParam hParams )
+{
+	Address adrNextBot = hParams.GetAddress( 1 );
+
+	int iSurvivorBot = INextBot_MySurvivorBotPointer( adrNextBot );
+
+	if ( iSurvivorBot != INVALID_ENT_REFERENCE )
+	{
+		Address adrLastKnownArea = CBaseCombatCharacter_GetLastKnownArea( GetEntityAddress( iSurvivorBot ) );
+
+		if ( adrLastKnownArea )
+		{
+			NavAttributeType fNavAttributeType = CNavArea_GetAttributes( adrLastKnownArea );
+
+			if ( fNavAttributeType & NAV_MESH_CROUCH )
+			{
+				INextBotPlayerInput_PressCrouchButton( iSurvivorBot );
+			}
+
+			if ( g_bStopping[iSurvivorBot] )
+			{
+				float flVecAbsVelocity[3];
+				GetEntPropVector( iSurvivorBot, Prop_Data, "m_vecAbsVelocity", flVecAbsVelocity );
+
+				if ( GetVectorLength( flVecAbsVelocity, true ) >= 0.1 )
+				{
+					return MRES_Supercede;
+				}
+
+				g_bStopping[iSurvivorBot] = false;
+			}
+
+			if ( fNavAttributeType & NAV_MESH_JUMP )
+			{
+				ILocomotion_Jump( INextBot_GetLocomotionInterface( adrNextBot ) );
+			}
 		}
 	}
 
@@ -145,22 +227,35 @@ public void OnPluginStart()
 		SetFailState( "Unable to find gamedata offset entry for \"" ... %0 ... "\"" );\
 	}
 
+#define DYNAMIC_DETOUR_SET_FROM_CONF_WRAPPER(%0,%1)\
+	if ( !%0.SetFromConf( hGameData, SDKConf_Signature, %1 ) )\
+	{\
+		delete hGameData;\
+		\
+		SetFailState( "Unable to find gamedata signature entry for \"" ... %1 ... "\"" );\
+	}
+
 	int iVtbl_ILocomotion_IsRunning;
 	GET_OFFSET_WRAPPER(iVtbl_ILocomotion_IsRunning, "ILocomotion::IsRunning")
 
+	int iVtbl_CBasePlayer_OnNavAreaChanged;
+	GET_OFFSET_WRAPPER(iVtbl_CBasePlayer_OnNavAreaChanged, "CBasePlayer::OnNavAreaChanged")
+
 	GET_OFFSET_WRAPPER(g_nOffset_PlayerLocomotion_m_player, "PlayerLocomotion::m_player")
 	GET_OFFSET_WRAPPER(g_nOffset_CNavArea_m_attributeFlags, "CNavArea::m_attributeFlags")
+	GET_OFFSET_WRAPPER(g_nOffset_NextBotPlayer_CTerrorPlayer_m_inputButtons, "NextBotPlayer<CTerrorPlayer>::m_inputButtons")
+	GET_OFFSET_WRAPPER(g_nOffset_NextBotPlayer_CTerrorPlayer_m_crouchButtonTimer, "NextBotPlayer<CTerrorPlayer>::m_crouchButtonTimer")
 
 	g_hDHook_ILocomotion_IsRunning = new DynamicHook( iVtbl_ILocomotion_IsRunning, HookType_Raw, ReturnType_Bool, ThisPointer_Address );
+	g_hDHook_CBasePlayer_OnNavAreaChanged = new DynamicHook( iVtbl_CBasePlayer_OnNavAreaChanged, HookType_Entity, ReturnType_Void, ThisPointer_CBaseEntity );
+	g_hDHook_CBasePlayer_OnNavAreaChanged.AddParam( HookParamType_ObjectPtr );
+	g_hDHook_CBasePlayer_OnNavAreaChanged.AddParam( HookParamType_ObjectPtr );
 
 	DynamicDetour hDDetour_PathFollower_Climbing = new DynamicDetour( Address_Null, CallConv_THISCALL, ReturnType_Bool, ThisPointer_Address );
+	DynamicDetour hDDetour_PathFollower_Update = new DynamicDetour( Address_Null, CallConv_THISCALL, ReturnType_Void, ThisPointer_Address );
 
-	if ( !hDDetour_PathFollower_Climbing.SetFromConf( hGameData, SDKConf_Signature, "PathFollower::Climbing" ) )
-	{
-		delete hGameData;
-
-		SetFailState( "Unable to find gamedata signature entry for \"PathFollower::Climbing\"" );
-	}
+	DYNAMIC_DETOUR_SET_FROM_CONF_WRAPPER(hDDetour_PathFollower_Climbing, "PathFollower::Climbing")
+	DYNAMIC_DETOUR_SET_FROM_CONF_WRAPPER(hDDetour_PathFollower_Update, "PathFollower::Update")
 
 	hDDetour_PathFollower_Climbing.AddParam( HookParamType_ObjectPtr );
 	hDDetour_PathFollower_Climbing.AddParam( HookParamType_ObjectPtr );
@@ -168,6 +263,9 @@ public void OnPluginStart()
 	hDDetour_PathFollower_Climbing.AddParam( HookParamType_VectorPtr );
 	hDDetour_PathFollower_Climbing.AddParam( HookParamType_Float );
 	hDDetour_PathFollower_Climbing.Enable( Hook_Pre, DDetour_PathFollower_Climbing );
+
+	hDDetour_PathFollower_Update.AddParam( HookParamType_ObjectPtr );
+	hDDetour_PathFollower_Update.Enable( Hook_Pre, DDetour_PathFollower_Update );
 
 	StartPrepSDKCall( SDKCall_Raw );
 	PREP_SDK_VCALL_SET_FROM_CONF_WRAPPER("INextBot::GetLocomotionInterface")
@@ -189,6 +287,10 @@ public void OnPluginStart()
 	PrepSDKCall_SetReturnInfo( SDKType_PlainOldData, SDKPass_Plain );
 	g_hSDKCall_CBaseCombatCharacter_GetLastKnownArea = EndPrepSDKCall();
 
+	StartPrepSDKCall( SDKCall_Raw );
+	PREP_SDK_VCALL_SET_FROM_CONF_WRAPPER("ILocomotion::Jump")
+	g_hSDKCall_ILocomotion_Jump = EndPrepSDKCall();
+
 	delete hGameData;
 
 	for ( int iClient = 1; iClient <= MaxClients; iClient++ )
@@ -204,7 +306,7 @@ public Plugin myinfo =
 {
 	name = "[L4D/2] Survivor Bot Nav Fixes",
 	author = "Justin \"Jay\" Chellah",
-	description = "Fixes issues where survivor bots would not respect areas marked as WALK and NO_JUMP",
-	version = "1.0.0",
+	description = "Fixes issues where survivor bots would not respect areas marked as WALK, CROUCH, STOP, JUMP and NO_JUMP",
+	version = "1.1.0",
 	url = "https://github.com/jchellah/survivor_bot_nav_fixes"
 };
