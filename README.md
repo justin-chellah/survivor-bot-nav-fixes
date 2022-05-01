@@ -3,3 +3,10 @@ A SourceMod plugin which allows level designers to use **WALK, CROUCH, STOP, JUM
 
 # Requirements
 [SourceMod 1.11.6820+](https://www.sourcemod.net/downloads.php?branch=dev)
+
+# Supported Platforms
+- Linux
+  - **Left 4 Dead** and **Left 4 Dead 2**
+
+- Windows
+  - Only **Left 4 Dead 2**
